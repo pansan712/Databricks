@@ -1,0 +1,84 @@
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (StringIndexer, VectorAssembler, OneHotEncoder, Imputer)
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+import mlflow
+from delta.tables import *
+
+# SparkSession
+spark = SparkSession.builder.appName("BankingAccelerator").getOrCreate()
+
+# 1. Data Ingestion & Preparation (Delta Lake)
+delta_table_path = "/path/to/banking_data"
+
+# Load Delta Table with Schema Evolution Support
+df = spark.read.format("delta").load(delta_table_path)
+
+# Enhanced Data Cleaning & Preprocessing
+columns_to_impute = ["age", "balance", "duration", "campaign", "pdays", "previous"]
+imputer = Imputer(inputCols=columns_to_impute, outputCols=[col + "_filled" for col in columns_to_impute])
+df = imputer.fit(df).transform(df)
+
+# Feature Engineering
+df = df.withColumn("account_age_days", (df.current_date - df.account_creation_date).cast("long"))
+
+# 2. Exploratory Data Analysis (EDA)
+# Statistical Summary
+print("Statistical Summary:")
+df.describe().show()
+
+# Correlation Analysis (For Numerical Features)
+numerical_cols = ["age_filled", "balance_filled", "duration_filled", "campaign_filled", "pdays_filled", "previous_filled", "account_age_days"]
+for col in numerical_cols:
+    correlation = df.stat.corr(col, "y")
+    print(f"Correlation between {col} and y (deposit subscription): {correlation:.3f}")
+
+# Visualization (Use Databricks Display for plotting)
+import pandas as pd
+pandas_df = df.select("age_filled", "balance_filled", "y").toPandas()
+display(pandas_df.hist())
+
+# 3. Machine Learning with Hyperparameter Tuning & MLflow Tracking
+mlflow.set_experiment("/BankingAccelerator")
+
+categorical_cols = ["job", "marital", "education", "default", "housing", "loan", "contact", "month", "day_of_week", "poutcome"]
+numerical_cols = [col + "_filled" for col in columns_to_impute] + ["account_age_days"]
+
+indexers = [StringIndexer(inputCol=col, outputCol=col+"_index") for col in categorical_cols]
+encoders = [OneHotEncoder(inputCols=[indexer.getOutputCol() for indexer in indexers], 
+                          outputCols=[col+"_encoded" for col in categorical_cols])]
+assembler = VectorAssembler(inputCols=[encoder.getOutputCol() for encoder in encoders] + numerical_cols,
+                            outputCol="features")
+classifier = RandomForestClassifier(labelCol="y", featuresCol="features")  
+pipeline = Pipeline(stages=indexers + encoders + [assembler, classifier])
+
+paramGrid = ParamGridBuilder() \
+    .addGrid(classifier.numTrees, [10, 20]) \
+    .addGrid(classifier.maxDepth, [5, 10]) \
+    .build()
+
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=BinaryClassificationEvaluator(),
+                          numFolds=3)  
+
+# Split data into training and testing sets
+(trainingData, testData) = df.randomSplit([0.7, 0.3], seed=12345)
+
+with mlflow.start_run():
+    # Train model with cross-validation
+    cvModel = crossval.fit(trainingData)
+   
+    # Make predictions on the test set
+    predictions = cvModel.transform(testData)
+
+    # Evaluate best model
+    evaluator = BinaryClassificationEvaluator(labelCol="y")
+    auc = evaluator.evaluate(predictions)
+
+    # Log metrics, parameters, and best model to MLflow
+    mlflow.log_metric("auc", auc)
+    mlflow.log_params(cvModel.bestModel.stages[-1].extractParamMap())
+    mlflow.spark.log_model(cvModel.bestModel, "best_model") 
