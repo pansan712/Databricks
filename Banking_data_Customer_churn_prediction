@@ -1,0 +1,192 @@
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import (StringIndexer, VectorAssembler, OneHotEncoder, StandardScaler, Imputer)
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+import mlflow
+from delta.tables import *
+from databricks import feature_store
+from pyspark.ml.feature import RFormula
+from pyspark.ml.regression import GeneralizedLinearRegression
+from pyspark.mllib.evaluation import BinaryClassificationMetrics
+from sklearn.metrics import roc_curve, auc
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+
+# Create SparkSession
+spark = SparkSession.builder.appName("ChurnPredictionAccelerator").getOrCreate()
+
+# 1. Data Ingestion & Preparation (Delta Lake)
+delta_table_path = "/path/to/banking_data"
+
+# Load data from Delta Lake
+df = spark.read.format("delta").load(delta_table_path)
+
+# Basic Data Cleaning & Feature Engineering
+df = df.fillna(0, subset=["age", "balance", "credit_score"])
+df = df.withColumn("account_tenure_days", (df.current_date - df.account_creation_date).cast("long"))
+df = df.withColumn("avg_transaction_value", df.total_transaction_value / df.total_transactions)
+
+# Feature Store
+fs = feature_store.FeatureStoreClient()
+
+# Create and write features to feature store
+churn_features_df = df.select("customer_id", "age", "balance", "credit_score", "account_tenure_days", 
+                              "avg_transaction_value", "num_of_products", "is_active_member", "estimated_salary", "is_churned")
+fs.create_table(
+    name="churn_features",
+    primary_keys=["customer_id"],
+    df=churn_features_df,
+    description="Churn Features"
+)
+
+# 2. Enhanced Exploratory Data Analysis (EDA)
+# Feature Distribution Analysis
+for col in ["age", "balance", "credit_score", "account_tenure_days", "avg_transaction_value"]:
+  display(churn_features_df.select(col).describe())
+
+# Churn Rate by Categorical Features
+for col in ["geography", "gender", "has_cr_card", "is_active_member", "num_of_products"]:
+  display(churn_features_df.groupBy(col, "is_churned").count().withColumn("churn_rate", (col("count")/sum("count").over(Window.partitionBy(col))).cast("double")))
+
+# 3. Machine Learning (MLflow Tracking)
+
+# Fetch features from the feature store
+training_set = fs.create_training_set(
+    df,
+    feature_lookup=[
+        "churn_features.age",
+        "churn_features.balance",
+        "churn_features.credit_score",
+        "churn_features.account_tenure_days",
+        "churn_features.avg_transaction_value",
+        "churn_features.num_of_products",
+        "churn_features.is_active_member",
+        "churn_features.estimated_salary"
+    ],
+    label="is_churned",
+    exclude_columns=["customer_id"]
+)
+
+training_df = training_set.load_df().na.drop()
+
+# Formula-based Feature Transformation (RFormula)
+formula = RFormula(formula="is_churned ~ .", featuresCol="features", labelCol="is_churned")
+glm = GeneralizedLinearRegression(family="binomial", link="logit", maxIter=10, regParam=0.3)
+pipeline = Pipeline(stages=[formula, glm])
+
+# Hyperparameter Tuning
+paramGrid = (ParamGridBuilder()
+             .addGrid(glm.regParam, [0.1, 0.01])
+             .build())
+
+crossval = CrossValidator(estimator=pipeline,
+                          estimatorParamMaps=paramGrid,
+                          evaluator=BinaryClassificationEvaluator(metricName="areaUnderROC"),
+                          numFolds=3)
+
+mlflow.set_experiment("/churn_prediction")
+with mlflow.start_run():
+    # Train with Cross Validation
+    cvModel = crossval.fit(training_df)
+    
+    # Make predictions on the test set
+    test_set = fs.create_training_set(
+        df,
+        feature_lookup=[
+            "churn_features.age",
+            "churn_features.balance",
+            "churn_features.credit_score",
+            "churn_features.account_tenure_days",
+            "churn_features.avg_transaction_value",
+            "churn_features.num_of_products",
+            "churn_features.is_active_member",
+            "churn_features.estimated_salary"
+        ],
+        label="is_churned",
+        exclude_columns=["customer_id"]
+    )
+
+    test_df = test_set.load_df().na.drop()
+
+    predictions = cvModel.transform(test_df)
+
+    # Evaluate Model
+    evaluator = BinaryClassificationEvaluator(metricName="areaUnderROC")
+    auc = evaluator.evaluate(predictions)
+
+    # Log model and parameters
+    mlflow.spark.log_model(cvModel.bestModel, "best_model")
+    mlflow.log_params(cvModel.bestModel.stages[-1].extractParamMap())
+    mlflow.log_metric("test_auc", auc)
+
+
+# 4. Model Deployment & Monitoring
+
+# Register the best model in MLflow Model Registry
+model_name = "churn_prediction_model"
+mv = mlflow.register_model(f"runs:/{mlflow.active_run().info.run_id}/best_model", model_name)
+
+# Create or update a Databricks Model Serving endpoint
+endpoint_name = "churn_prediction_endpoint"
+try:
+    endpoint = mlflow.get_endpoint(endpoint_name)
+    mlflow.databricks.update_endpoint(endpoint_name, mv.version)
+except:
+    mlflow.databricks.create_endpoint(endpoint_name, mv.version)
+
+# Define input schema for the model
+from mlflow.types import Schema, ColSpec
+input_schema = Schema([
+    ColSpec("double", "age"),
+    ColSpec("double", "balance"),
+    ColSpec("double", "credit_score"),
+    ColSpec("double", "account_tenure_days"),
+    ColSpec("double", "avg_transaction_value"),
+    ColSpec("integer", "num_of_products"),
+    ColSpec("boolean", "is_active_member"),
+    ColSpec("double", "estimated_salary")
+])
+
+# Test the deployed model
+import requests
+import json
+
+sample_input = {
+    "age": 30,
+    "balance": 50000,
+    "credit_score": 750,
+    "account_tenure_days": 1200,
+    "avg_transaction_value": 1500,
+    "num_of_products": 3,
+    "is_active_member": True,
+    "estimated_salary": 60000
+}
+
+response = requests.post(
+    f"https://{DATABRICKS_HOSTNAME}/serving-endpoints/{endpoint_name}/invocations", 
+    headers={"Authorization": f"Bearer {DATABRICKS_TOKEN}"},
+    json={"dataframe_records": [sample_input]},
+)
+
+print(response.json())
+
+# Monitor the model (Example using MLflow)
+from mlflow.tracking import MlflowClient
+
+client = MlflowClient()
+latest_versions = client.get_latest_versions(model_name)
+
+for version in latest_versions:
+    # Get evaluation metrics for the model version
+    run_id = version.run_id
+    run = client.get_run(run_id)
+    metrics = run.data.metrics
+    
+    # Check if performance has dropped significantly (example threshold)
+    if metrics.get("test_auc", 0) < 0.7:
+        # Send alert (e.g., email, Slack)
+        print(f"Warning: Model performance dropped for version {version.version}")
